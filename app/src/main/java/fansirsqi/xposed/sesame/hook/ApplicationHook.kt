@@ -609,6 +609,7 @@ class ApplicationHook {
         // --- 初始化核心逻辑 ---
         @Synchronized
         private fun initHandler(): Boolean {
+            offline = false
             try {
                 if (init) destroyHandler()
 
@@ -634,8 +635,10 @@ class ApplicationHook {
                 HookUtil.hookUser(classLoader!!)
                 record(TAG, "芝麻粒-TK 开始初始化...")
 
-                Config.load(userId)
+               Config.load(userId)
                 if (!Config.isLoaded()) return false
+                    // 加下面这一行
+                Status.load(userId) // 强制加载状态，跳过授权验证
 
                 Notify.start(service!!)
                 setWakenAtTimeAlarm()
