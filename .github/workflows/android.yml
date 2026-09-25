@@ -10,17 +10,20 @@ env:
   CI: "true"
   JAVA_DISTRIBUTION: "oracle"
   JAVA_VERSION: "17.0.1"
-  ANDROID_API_LEVEL: "36"
-  ANDROID_BUILD_TOOLS: "36.0.0"
-  LOCAL_GRADLE_VERSION: "9.4.0-milestone-3"
-  LOCAL_AGP_VERSION: "9.0.1"
+  ANDROID_API_LEVEL: "37"
+  ANDROID_PLATFORM: "android-37.0"
+  ANDROID_BUILD_TOOLS: "37.0.0"
+  LOCAL_GRADLE_VERSION: "9.5.1"
+  LOCAL_AGP_VERSION: "9.2.1"
   LOCAL_KOTLIN_VERSION: "2.2.10"
   RELEASE_DIR: app/build/outputs/apk/release
   STAGING_DIR: app/build/outputs/apk/all
   ASSET_DIR: app/build/outputs/apk/release-assets
+  ARTIFACT_PASSWORD: Sesame-AG
   RELEASE_TAG_RAW: ${{ github.ref_name }}
   TARGET_SOURCE_BRANCH: dev
   TARGET_MODULE_REPO: Xposed-Modules-Repo/io.github.aoguai.sesameag
+  PUBLISH_TO_XPOSED_REPO: "false"
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -40,6 +43,7 @@ jobs:
       version_name: ${{ steps.meta.outputs.version_name }}
       version_code: ${{ steps.meta.outputs.version_code }}
       xposed_tag: ${{ steps.meta.outputs.xposed_tag }}
+      official_signing_cert_sha256: ${{ steps.check.outputs.official_signing_cert_sha256 }}
 
     steps:
       - name: Set Timezone to Asia/Shanghai
@@ -65,6 +69,7 @@ jobs:
           grep -Eq '^kotlin = "'"${LOCAL_KOTLIN_VERSION//./\\.}"'"$' gradle/libs.versions.toml
           grep -Eq '^appVersion=.+' gradle.properties
           grep -Eq 'compileSdk = '"${ANDROID_API_LEVEL}"'$' app/build.gradle.kts
+          grep -Eq 'buildToolsVersion = "'"${ANDROID_BUILD_TOOLS//./\\.}"'"$' app/build.gradle.kts
           grep -Eq 'sourceCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
           grep -Eq 'targetCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
 
@@ -119,24 +124,40 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          OFFICIAL_SIGNING_CERT_SHA256: ${{ vars.OFFICIAL_SIGNING_CERT_SHA256 }}
           TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          PUBLISH_TO_XPOSED_REPO: ${{ env.PUBLISH_TO_XPOSED_REPO }}
         run: |
           set -euo pipefail
 
           git fetch origin "refs/heads/${TARGET_SOURCE_BRANCH}:refs/remotes/origin/${TARGET_SOURCE_BRANCH}" --force
 
           missing=()
+          invalid=()
+          fingerprint_format_valid="false"
+          if [[ "${OFFICIAL_SIGNING_CERT_SHA256}" =~ ^[0-9A-F]{64}$ ]]; then
+            fingerprint_format_valid="true"
+          fi
           [[ -n "${ANDROID_SIGNING_KEY}" ]] || missing+=("ANDROID_SIGNING_KEY")
           [[ -n "${ANDROID_KEY_ALIAS}" ]] || missing+=("ANDROID_KEY_ALIAS")
           [[ -n "${ANDROID_KEYSTORE_PASSWORD}" ]] || missing+=("ANDROID_KEYSTORE_PASSWORD")
           [[ -n "${ANDROID_KEY_PASSWORD}" ]] || missing+=("ANDROID_KEY_PASSWORD")
-          [[ -n "${TARGET_REPO_PAT}" ]] || missing+=("TARGET_REPO_PAT")
+          if [[ -z "${OFFICIAL_SIGNING_CERT_SHA256}" ]]; then
+            missing+=("OFFICIAL_SIGNING_CERT_SHA256")
+          elif [[ "${fingerprint_format_valid}" != "true" ]]; then
+            invalid+=("OFFICIAL_SIGNING_CERT_SHA256")
+          fi
+          if [[ "${PUBLISH_TO_XPOSED_REPO}" == "true" ]]; then
+            [[ -n "${TARGET_REPO_PAT}" ]] || missing+=("TARGET_REPO_PAT")
+          fi
 
           ready="false"
           reason=""
 
           if [[ ${#missing[@]} -gt 0 ]]; then
-            reason="缺少必要 Secrets: ${missing[*]}"
+            reason="缺少必要发布配置: ${missing[*]}"
+          elif [[ ${#invalid[@]} -gt 0 ]]; then
+            reason="发布配置格式错误: ${invalid[*]} 必须是 64 位无冒号大写十六进制 SHA-256 指纹"
           elif [[ "${TAG_VALID}" != "true" ]]; then
             reason="标签 ${RELEASE_TAG_RAW} 不符合 Xposed 要求的 VersionCode-VersionName 格式"
           elif [[ "${VERSION_NAME}" != "${CONFIGURED_VERSION_NAME}" ]]; then
@@ -145,6 +166,9 @@ jobs:
             reason="标签中的 versionCode (${TAG_VERSION_CODE}) 与当前提交计算得到的 versionCode (${VERSION_CODE}) 不一致"
           elif ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${TARGET_SOURCE_BRANCH}"; then
             reason="标签 ${RELEASE_TAG_RAW} 指向的提交不在 ${TARGET_SOURCE_BRANCH} 分支上"
+          elif [[ "${PUBLISH_TO_XPOSED_REPO}" != "true" ]]; then
+            ready="true"
+            reason="预检通过"
           else
             api_url="https://api.github.com/repos/${TARGET_MODULE_REPO}"
             if http_code="$(curl -sS -o target_repo.json -w "%{http_code}" \
@@ -175,6 +199,7 @@ jobs:
           fi
 
           echo "ready=${ready}" >> "$GITHUB_OUTPUT"
+          echo "official_signing_cert_sha256=${OFFICIAL_SIGNING_CERT_SHA256}" >> "$GITHUB_OUTPUT"
           {
             echo "reason<<EOF"
             printf '%s\n' "${reason}"
@@ -194,6 +219,8 @@ jobs:
             echo "- 版本号: \`${VERSION_CODE}\`"
             echo "- 模块仓库标签: \`${XPOSED_TAG}\`"
             echo "- 目标仓库: \`${TARGET_MODULE_REPO}\`"
+            echo "- 发布到目标仓库: \`${PUBLISH_TO_XPOSED_REPO}\`"
+            echo "- 官方证书指纹格式有效: \`${fingerprint_format_valid}\`"
             echo "- 检查结果: ${reason}"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -203,6 +230,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      OFFICIAL_SIGNING_CERT_SHA256: ${{ needs.preflight.outputs.official_signing_cert_sha256 }}
 
     steps:
       - name: Set Timezone to Asia/Shanghai
@@ -244,7 +273,7 @@ jobs:
           set -euo pipefail
           sdkmanager --install \
             "platform-tools" \
-            "platforms;android-${ANDROID_API_LEVEL}" \
+            "platforms;${ANDROID_PLATFORM}" \
             "build-tools;${ANDROID_BUILD_TOOLS}"
           # `yes` will receive SIGPIPE after sdkmanager finishes reading input.
           # Run this pipeline without pipefail so the step reflects sdkmanager's exit code.
@@ -277,7 +306,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --stacktrace assembleRelease
+          ./gradlew --no-daemon --stacktrace -PofficialSigningCertSha256="${OFFICIAL_SIGNING_CERT_SHA256}" assembleRelease
 
       - name: Stage Unsigned APKs
         shell: bash
@@ -305,34 +334,57 @@ jobs:
           keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
           buildToolsVersion: ${{ env.ANDROID_BUILD_TOOLS }}
 
-      - name: Prepare Release Assets
-        id: prepare_assets
+      - name: Verify Official APK Signatures
         shell: bash
+        env:
+          SIGNED_FILES: ${{ steps.sign_apks.outputs.signedFiles }}
         run: |
           set -euo pipefail
-          mkdir -p "${ASSET_DIR}"
-          IFS=':' read -r -a files <<< "${{ steps.sign_apks.outputs.signedFiles }}"
-          copied=0
-          for file in "${files[@]}"; do
-            [[ -n "${file}" ]] || continue
-            cp "${file}" "${ASSET_DIR}/"
-            (
-              cd "${ASSET_DIR}"
-              sha256sum "$(basename "${file}")" > "CHECKSUMS-$(basename "${file}").sha256"
-            )
-            copied=$((copied + 1))
-          done
-          if [[ ${copied} -eq 0 ]]; then
-            echo "No signed APKs were produced" >&2
+
+          android_sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          apksigner_path="${android_sdk_root}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          if [[ -z "${android_sdk_root}" || ! -x "${apksigner_path}" ]]; then
+            echo "Unable to locate apksigner for build-tools ${ANDROID_BUILD_TOOLS}" >&2
             exit 1
           fi
-          echo "asset_dir=${ASSET_DIR}" >> "$GITHUB_OUTPUT"
+
+          IFS=':' read -r -a files <<< "${SIGNED_FILES}"
+          verified=0
+          for file in "${files[@]}"; do
+            [[ -n "${file}" ]] || continue
+            [[ -f "${file}" ]] || {
+              echo "Signed APK is missing: ${file}" >&2
+              exit 1
+            }
+
+            cert_output=""
+            if ! cert_output="$("${apksigner_path}" verify --verbose --print-certs "${file}")"; then
+              echo "APK signature verification failed: ${file}" >&2
+              exit 1
+            fi
+            mapfile -t fingerprints < <(
+              printf '%s\n' "${cert_output}" |
+                awk -F': ' '/certificate SHA-256 digest:/ { digest=$NF; gsub(/:/, "", digest); print toupper(digest) }'
+            )
+            if [[ ${#fingerprints[@]} -ne 1 || "${fingerprints[0]}" != "${OFFICIAL_SIGNING_CERT_SHA256}" ]]; then
+              echo "Unexpected signing certificate for ${file}" >&2
+              echo "Expected: ${OFFICIAL_SIGNING_CERT_SHA256}" >&2
+              printf 'Actual: %s\n' "${fingerprints[*]:-<none>}" >&2
+              exit 1
+            fi
+            verified=$((verified + 1))
+          done
+
+          if [[ ${verified} -eq 0 ]]; then
+            echo "No signed APKs were provided by the signing action" >&2
+            exit 1
+          fi
 
       - name: Generate Release Notes
         id: release_notes
         shell: bash
         env:
-          GITHUB_API_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+          GITHUB_API_TOKEN: ${{ secrets.TARGET_REPO_PAT || github.token }}
           REPOSITORY: ${{ github.repository }}
           XPOSED_TAG: ${{ needs.preflight.outputs.xposed_tag }}
         run: |
@@ -533,7 +585,69 @@ jobs:
 
           echo "body_path=${body_path}" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare Release Assets
+        id: prepare_assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${ASSET_DIR}"
+          IFS=':' read -r -a files <<< "${{ steps.sign_apks.outputs.signedFiles }}"
+          copied=0
+          for file in "${files[@]}"; do
+            [[ -n "${file}" ]] || continue
+            cp "${file}" "${ASSET_DIR}/"
+            (
+              cd "${ASSET_DIR}"
+              sha256sum "$(basename "${file}")" > "CHECKSUMS-$(basename "${file}").sha256"
+            )
+            copied=$((copied + 1))
+          done
+          if [[ ${copied} -eq 0 ]]; then
+            echo "No signed APKs were produced" >&2
+            exit 1
+          fi
+          (
+            cd "${ASSET_DIR}"
+            sha256sum -- *.apk > SHA256SUMS
+          )
+          {
+            echo "Sesame-AG official signing certificate"
+            echo
+            echo "SHA-256 certificate fingerprint (uppercase, no colons):"
+            echo "${OFFICIAL_SIGNING_CERT_SHA256}"
+            echo
+            echo "Verify an APK independently with:"
+            echo "apksigner verify --verbose --print-certs <apk>"
+          } > "${ASSET_DIR}/OFFICIAL-SIGNING-CERTIFICATE.txt"
+          if [[ "${PUBLISH_TO_XPOSED_REPO}" != "true" ]]; then
+            cp "${{ steps.release_notes.outputs.body_path }}" "${ASSET_DIR}/RELEASE_NOTES-${RELEASE_TAG_RAW}.md"
+          fi
+          echo "asset_dir=${ASSET_DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: Package APK Artifact
+        if: env.PUBLISH_TO_XPOSED_REPO != 'true'
+        id: package_artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_path="${RUNNER_TEMP}/Sesame-AG-${RELEASE_TAG_RAW}.zip"
+          (
+            cd "${ASSET_DIR}"
+            zip -r -P "${ARTIFACT_PASSWORD}" "${artifact_path}" .
+          )
+          echo "artifact_path=${artifact_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK Artifact
+        if: env.PUBLISH_TO_XPOSED_REPO != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Sesame-AG-${{ github.ref_name }}
+          archive: false
+          path: ${{ steps.package_artifact.outputs.artifact_path }}
+          if-no-files-found: error
+
       - name: Sync Release to Target Repository
+        if: env.PUBLISH_TO_XPOSED_REPO == 'true'
         uses: softprops/action-gh-release@v2
         with:
           repository: ${{ env.TARGET_MODULE_REPO }}
